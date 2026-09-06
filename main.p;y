@@ -1,275 +1,316 @@
 import time
-import json
-import logging
+import threading
 import requests
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from collections import Counter
-from datetime import datetime
+from telebot import types
+from telebot.apihelper import ApiTelegramException
 
-# ==================== কনফিগারেশন ====================
-BOT_TOKEN = "8949748635:AAF9w3mFRx2fqcE6AslsrR7AUuNJQzqB-PA"  # আপনার টেলিগ্রাম বট টোকেন দিন
-CHANNEL_OR_CHAT_ID = "8707571669"  # যেখানে মেসেজ আপডেট হবে (@channel_name বা chat_id)
-API_URL = "https://advanced-predict1.ai.studio/apipid.json"  # উইনগো লাইভ API এন্ডপয়েন্ট
-
-GAME_NAME = "WINGO 5 MIN LIVE"
-SUB_TITLE = "COBRA STRIKE"
-TOTAL_TIME_SECONDS = 300  # ৫ মিনিটের জন্য ৩০০ সেকেন্ড (৩০ সেকেন্ড হলে ৩০ দিন)
-# ====================================================
+# --- কনফিগারেশন ---
+BOT_TOKEN = "8949748635:AAF9w3mFRx2fqcE6AslsrR7AUuNJQzqB-PA"
+API_URL = "https://advanced-predict1.ai.studio/apipid.json"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# রিয়েলটাইম স্ট্যাটাস (শুরু হবে ০ থেকে)
+# লাইভ স্ট্যাটাস (শুরু থেকে ০ থাকবে, কোনো ফেক ডাটা নেই)
 stats = {
-    "total_played": 0,
-    "total_wins": 0,
-    "total_losses": 0,
+    "total_games": 0,
+    "wins": 0,
+    "losses": 0,
     "current_loss_streak": 0,
-    "max_loss_streak": 0
+    "max_loss": 0,
+    "history": []  # [{'period': '2229', 'num': 2, 'type': 'SMALL', 'result': 'WIN'}]
 }
 
-# হিস্ট্রি টেবিলের রেকর্ড (সর্বশেষ ১০টি রাউন্ড)
-history_table = []
-current_prediction = None
-last_processed_period = None
-telegram_message_id = None
+# ইউজারের মেসেজ ও পেজ ট্র্যাকিং
+active_dashboards = {}  # {chat_id: message_id}
+user_pages = {}         # {chat_id: current_page (1 to 10)}
 
-# কালার ও বিগ/স্মল ম্যাপিং রুল
-def get_number_attributes(num):
+# বর্তমান লাইভ প্রেডিকশন
+current_pred = {
+    "period": None,
+    "n1": None,
+    "n2": None,
+    "btn_size": "BIG",
+    "btn_num": "NUM: -",
+    "btn_color": "RED",
+    "active_size": None,
+    "active_color": None
+}
+
+def get_color(num):
+    """নাম্বারের কালার নির্ধারণ: 0,2,4,6,8 = RED এবং 1,3,5,7,9 = GREEN"""
     num = int(num)
-    # Big / Small
-    size = "BIG" if num >= 5 else "SMALL"
-    # Color
-    if num in [1, 3, 7, 9]:
-        color = "GREEN"
-    elif num in [2, 4, 6, 8]:
-        color = "RED"
-    elif num == 0:
-        color = "RED+VIOLET"
-    else:  # 5
-        color = "GREEN+VIOLET"
-    return size, color
+    if num in [0, 2, 4, 6, 8]:
+        return "RED"
+    return "GREEN"
 
-# প্রগ্রেস বার জেনারেটর
-def generate_progress_bar(remaining_sec, total_sec=TOTAL_TIME_SECONDS, length=12):
-    progress = max(0, min(1, (total_sec - remaining_sec) / total_sec))
-    filled = int(progress * length)
-    bar = "█" * filled + "▒" * (length - filled)
-    return f"⏳ {remaining_sec}S [{bar}]"
+def get_size(num):
+    """নাম্বারের সাইজ নির্ধারণ: 0-4 = SMALL এবং 5-9 = BIG"""
+    num = int(num)
+    return "BIG" if num >= 5 else "SMALL"
 
-# ==================== প্রেডিকশন লজিক ====================
-def analyze_and_predict(all_history):
+def analyze_pattern(market_history):
     """
-    ভিডিওর লজিক:
-    ১. পেজ ১ ও ২ বাদ দিয়ে (সর্বশেষ ২০টি রেকর্ড স্কিপ করে) পেজ ৩ থেকে ৫০ পর্যন্ত হিস্ট্রি সার্চ করা হয়।
-    ২. বর্তমান শেষের ২-৩টি ডিজিট প্যাটার্ন ম্যাচ করানো হয়।
-    ৩. অতীতে এই ডিজিটগুলোর পর কোন ২ ডিজিট সবচেয়ে বেশি এসেছে তা বের করে জ্যাকপট প্রেডিকশন দেওয়া হয়।
-    ৪. বিগ/স্মল এবং কালার কনফার্মেশন ও একিউরেসি পারসেন্টেজ ক্যালকুলেট করা হয়।
+    পেজ ১ ও ২ (প্রথম ২০টি ড্র) বাদ দিয়ে পেজ ৩ থেকে ১০ (বাকি ডাটা)
+    এর ভেতর টপের ২ ডিজিট বা তার উল্টো সিকোয়েন্স খুঁজে উপরের ও নিচের নাম্বার বের করা।
     """
-    if len(all_history) < 30:
-        # পর্যাপ্ত হিস্ট্রি না থাকলে ডিফল্ট
-        return {
-            "size": "BIG", "size_pct": 75,
-            "num1": 3, "num2": 8,
-            "color": "GREEN", "color_pct": 80
-        }
-
-    # পেজ ১ ও ২ বাদ (প্রথম ২০টি রেকর্ড স্কিপ)
-    current_recent = [x["number"] for x in all_history[:2]]  # শেষের ২ ডিজিট
-    search_space = all_history[20:]  # পেজ ৩ থেকে পেজ ৫০ পর্যন্ত
-
-    matched_next_numbers = []
-    
-    # হিস্ট্রিতে ২ ডিজিট প্যাটার্ন মেলানো
-    for i in range(len(search_space) - 2):
-        if search_space[i+1]["number"] == current_recent[0] and search_space[i+2]["number"] == current_recent[1]:
-            matched_next_numbers.append(search_space[i]["number"])
-
-    # প্যাটার্ন ম্যাচ না পেলে সিঙ্গেল ডিজিট ও হট নাম্বার ট্রেন্ড লজিক
-    if len(matched_next_numbers) < 2:
-        for i in range(len(search_space) - 1):
-            if search_space[i+1]["number"] == current_recent[0]:
-                matched_next_numbers.append(search_space[i]["number"])
-
-    if not matched_next_numbers:
-        matched_next_numbers = [x["number"] for x in search_space[:20]]
-
-    # সর্বাধিক আসা সেরা ২টি নাম্বার (2-Digit Jackpot Prediction)
-    counts = Counter(matched_next_numbers)
-    top_two = [num for num, _ in counts.most_common(2)]
-    if len(top_two) == 1:
-        top_two.append((top_two[0] + 5) % 10)
-
-    num1, num2 = top_two[0], top_two[1]
-
-    # বিগ/স্মল বিশ্লেষণ
-    big_votes = sum(1 for n in matched_next_numbers if n >= 5)
-    small_votes = len(matched_next_numbers) - big_votes
-    total_votes = len(matched_next_numbers)
-
-    if big_votes > small_votes:
-        pred_size = "BIG"
-        size_pct = int((big_votes / total_votes) * 100)
-    elif small_votes > big_votes:
-        pred_size = "SMALL"
-        size_pct = int((small_votes / total_votes) * 100)
+    if len(market_history) < 25:
+        n1, n2 = 7, 3
     else:
-        pred_size = "❌"  # কনফ্লিক্ট হলে ক্যানসেল
-        size_pct = 50
+        # টপের ২টি সংখ্যা
+        top_n1 = int(market_history[0].get("number", 0))
+        top_n2 = int(market_history[1].get("number", 0))
+        
+        pair_normal = [top_n2, top_n1]
+        pair_reverse = [top_n1, top_n2]
+        
+        # পেজ ১ ও ২ বাদ দিয়ে পেজ ৩ থেকে অনুসন্ধান (ইনডেক্স ২০ থেকে শুরু)
+        search_list = market_history[20:]
+        found_n1, found_n2 = None, None
 
-    # কালার বিশ্লেষণ
-    green_votes = sum(1 for n in matched_next_numbers if n in [1, 3, 5, 7, 9])
-    red_votes = sum(1 for n in matched_next_numbers if n in [0, 2, 4, 6, 8])
+        for i in range(1, len(search_list) - 2):
+            curr_pair = [
+                int(search_list[i+1].get("number", -1)),
+                int(search_list[i].get("number", -1))
+            ]
+            # সোজা অথবা উল্টো সিকোয়েন্স ম্যাচিং
+            if curr_pair == pair_normal or curr_pair == pair_reverse:
+                # ওই পেয়ারের ঠিক উপরের এবং নিচের সংখ্যা নেওয়া
+                found_n1 = int(search_list[i-1].get("number", 0))  # উপরের
+                found_n2 = int(search_list[i+2].get("number", 0))  # নিচের
+                break
+        
+        if found_n1 is not None and found_n2 is not None:
+            n1, n2 = found_n1, found_n2
+        else:
+            # ম্যাচ না পেলে ব্যাকআপ ট্রেন্ড
+            n1 = (top_n1 + 4) % 10
+            n2 = (top_n2 + 3) % 10
 
-    if green_votes > red_votes:
-        pred_color = "GREEN"
-        color_pct = int((green_votes / total_votes) * 100)
-    elif red_votes > green_votes:
-        pred_color = "RED"
-        color_pct = int((red_votes / total_votes) * 100)
+    s1, s2 = get_size(n1), get_size(n2)
+    c1, c2 = get_color(n1), get_color(n2)
+
+    btn_size = ""
+    btn_color = ""
+    active_size = None
+    active_color = None
+
+    # ১. সাইজ এক কিন্তু কালার ভিন্ন -> শুধু সাইজ প্রেডিকশন
+    if s1 == s2 and c1 != c2:
+        btn_size = s1
+        btn_color = "95%"
+        active_size = s1
+
+    # ২. কালার এক কিন্তু সাইজ ভিন্ন -> শুধু কালার প্রেডিকশন
+    elif c1 == c2 and s1 != s2:
+        btn_color = c1
+        btn_size = "95%"
+        active_color = c1
+
+    # ৩. সাইজ ও কালার উভয়ই এক -> দুটিই প্রেডিকশন
+    elif s1 == s2 and c1 == c2:
+        btn_size = s1
+        btn_color = c1
+        active_size = s1
+        active_color = c1
+
+    # ৪. সাইজ ও কালার উভয়ই ভিন্ন -> শুধু ২-ডিজিট নাম্বার
     else:
-        pred_color = "❌"
-        color_pct = 50
+        btn_size = "❌ 95%"
+        btn_color = "❌ 95%"
+
+    btn_num = f"NUM: {n1}" if n1 == n2 else f"NUM: {n1},{n2}"
 
     return {
-        "size": pred_size, "size_pct": size_pct,
-        "num1": num1, "num2": num2,
-        "color": pred_color, "color_pct": color_pct
+        "n1": n1,
+        "n2": n2,
+        "btn_size": btn_size,
+        "btn_num": btn_num,
+        "btn_color": btn_color,
+        "active_size": active_size,
+        "active_color": active_color
     }
 
-# ==================== টেলিগ্রাম কীবোর্ড তৈরি ====================
-def build_telegram_keyboard(period, remaining_sec, prediction):
-    markup = InlineKeyboardMarkup()
-
-    short_period = str(period)[-4:]  # ৪/৩ ডিজিট শর্ট ফরম্যাট
-    
-    # রো ১: পিরিয়ড এবং সর্বোচ্চ লস রেকর্ড (Max Loss)
-    markup.row(
-        InlineKeyboardButton(f"PERIOD: {short_period}", callback_data="none"),
-        InlineKeyboardButton(f"MAX LOSS: {stats['max_loss_streak']}", callback_data="none")
-    )
-
-    # রো ২: প্রগ্রেস বার
-    progress_text = generate_progress_bar(remaining_sec, TOTAL_TIME_SECONDS)
-    markup.row(InlineKeyboardButton(progress_text, callback_data="none"))
-
-    # রো ৩: বিগ/স্মল | ২-ডিজিট প্রেডিকশন | কালার প্রেডিকশন
-    size_btn = f"{prediction['size']} ({prediction['size_pct']}%)" if prediction['size'] != "❌" else "❌ SKIP"
-    num_btn = f"NUM: {prediction['num1']}, {prediction['num2']}"
-    color_emoji = "🟢 " if prediction['color'] == "GREEN" else "🔴 " if prediction['color'] == "RED" else "⚠️ "
-    color_btn = f"{color_emoji}{prediction['color']}" if prediction['color'] != "❌" else "❌"
-
-    markup.row(
-        InlineKeyboardButton(size_btn, callback_data="none"),
-        InlineKeyboardButton(num_btn, callback_data="none"),
-        InlineKeyboardButton(color_btn, callback_data="none")
-    )
-
-    # রো ৪+: হিস্ট্রি টেবিল (সর্বশেষ ৮-১০টি ফলাফল)
-    for row in history_table[:10]:
-        status_text = "WIN" if row["win"] else "LOSS"
-        markup.row(
-            InlineKeyboardButton(str(row["period"])[-4:], callback_data="none"),
-            InlineKeyboardButton(str(row["number"]), callback_data="none"),
-            InlineKeyboardButton(row["size"], callback_data="none"),
-            InlineKeyboardButton(status_text, callback_data="none")
-        )
-
-    return markup
-
-# ==================== API থেকে ডাটা ফেচ ====================
-def fetch_live_data():
+def fetch_market_data():
+    """API থেকে লাইভ ডাটা রিড করা"""
     try:
-        response = requests.get(API_URL, timeout=8)
-        if response.status_code == 200:
-            return response.json()
-    except Exception as e:
-        logging.error(f"API Fetch Error: {e}")
+        res = requests.get(API_URL, timeout=6)
+        if res.status_code == 200:
+            return res.json()
+    except Exception:
+        pass
     return None
 
-# ==================== মেইন লাইভ লুপ ====================
-def run_live_bot():
-    global telegram_message_id, current_prediction, last_processed_period
-    print("Bot is running 24/7 on terminal...")
+def build_interface(chat_id, period, seconds_left):
+    """ছবির ইন্টারফেস এবং ১০ পেজের বাটন গ্রিড তৈরি"""
+    # প্রগ্রেস বার (ছবির মতো)
+    filled = max(1, min(20, (30 - seconds_left) * 20 // 30))
+    bar = "█" * filled + "░" * (20 - filled)
+
+    header_text = (
+        f"<b>PERIOD: {period}</b>\n\n"
+        f"⏳ <b>{seconds_left:02d}S</b> [{bar}]"
+    )
+
+    markup = types.InlineKeyboardMarkup()
+
+    # রো ১: ৩টি প্রেডিকশন বাটন (ছবির মতো [BIG] [NUM: 7] [BACK/COLOR])
+    b_size = types.InlineKeyboardButton(current_pred["btn_size"], callback_data="pred_size")
+    b_num = types.InlineKeyboardButton(current_pred["btn_num"], callback_data="pred_num")
+    b_color = types.InlineKeyboardButton(current_pred["btn_color"], callback_data="pred_color")
+    markup.row(b_size, b_num, b_color)
+
+    # পেজিনেশন অনুযায়ী হিস্ট্রি নির্বাচন (প্রতি পেজে ১০টি রেজাল্ট)
+    current_page = user_pages.get(chat_id, 1)
+    all_history = list(reversed(stats["history"]))  # সাম্প্রতিক রেজাল্ট আগে
+    
+    start_idx = (current_page - 1) * 10
+    end_idx = start_idx + 10
+    page_items = all_history[start_idx:end_idx]
+
+    # রো ২-১১: ১০টি হিস্ট্রি রো (৪ কলাম: PERIOD, NUM, SIZE, WIN/LOSS)
+    for row in page_items:
+        b_p = types.InlineKeyboardButton(str(row["period"]), callback_data="h_p")
+        b_n = types.InlineKeyboardButton(str(row["num"]), callback_data="h_n")
+        b_s = types.InlineKeyboardButton(str(row["type"]), callback_data="h_s")
+        b_r = types.InlineKeyboardButton(str(row["result"]), callback_data="h_r")
+        markup.row(b_p, b_n, b_s, b_r)
+
+    # রো ১২: পেজ নেভিগেশন বাটন (১০টি পেজ ব্রাউজ করার জন্য)
+    btn_prev = types.InlineKeyboardButton("◀️ Prev", callback_data="page_prev")
+    btn_page = types.InlineKeyboardButton(f"Page {current_page}/10", callback_data="page_cur")
+    btn_next = types.InlineKeyboardButton("Next ▶️", callback_data="page_next")
+    markup.row(btn_prev, btn_page, btn_next)
+
+    return header_text, markup
+
+def check_win_loss(actual_num):
+    """প্রেডিকশন যাচাই ও উইন/লস স্ট্যাটাস আপডেট"""
+    is_win = False
+    actual_size = get_size(actual_num)
+    actual_color = get_color(actual_num)
+
+    # ১. নাম্বারে মিলে গেলে ডাইরেক্ট উইন (জ্যাকপট)
+    if actual_num in [current_pred["n1"], current_pred["n2"]]:
+        is_win = True
+    # ২. সাইজ প্রেডিকশন থাকলে এবং মিললে
+    elif current_pred["active_size"] and current_pred["active_size"] == actual_size:
+        is_win = True
+    # ৩. কালার প্রেডিকশন থাকলে এবং মিললে
+    elif current_pred["active_color"] and current_pred["active_color"] == actual_color:
+        is_win = True
+
+    stats["total_games"] += 1
+    if is_win:
+        stats["wins"] += 1
+        stats["current_loss_streak"] = 0
+        return "WIN"
+    else:
+        stats["losses"] += 1
+        stats["current_loss_streak"] += 1
+        if stats["current_loss_streak"] > stats["max_loss"]:
+            stats["max_loss"] = stats["current_loss_streak"]
+        return "LOSS"
+
+def live_worker():
+    """২৪ ঘণ্টা ব্যাকগ্রাউন্ডে চলার প্রধান ইঞ্জিন"""
+    global current_pred
+    last_period = None
 
     while True:
         try:
-            data = fetch_live_data()
-            if not data:
-                time.sleep(3)
-                continue
+            api_data = fetch_market_data()
+            if api_data:
+                payload = api_data.get("data", api_data)
+                period = payload.get("period", "00052230")
+                seconds_left = int(payload.get("seconds_left", payload.get("time_remaining", 10)))
+                history_list = payload.get("history", payload.get("list", []))
 
-            current_period = data.get("current_period")
-            remaining_seconds = data.get("remaining_seconds", 30)
-            history = data.get("history", [])  # পূর্ববর্তী রাউন্ডগুলোর ৫০ পেজের লিস্ট
+                # নতুন পিরিয়ড এলে আগেরটির রেজাল্ট হিসাব ও নতুন প্রেডিকশন জেনারেট
+                if period != last_period and last_period is not None:
+                    if history_list:
+                        latest_draw = history_list[0]
+                        actual_num = int(latest_draw.get("number", 0))
+                        actual_size = get_size(actual_num)
 
-            # নতুন পিরিয়ড শুরু হলে
-            if current_period != last_processed_period:
-                # আগের রাউন্ডের ফলাফল চেক করে WIN / LOSS নির্ধারণ
-                if current_prediction and history:
-                    last_result = history[0]
-                    actual_num = int(last_result["number"])
-                    actual_size, actual_color = get_number_attributes(actual_num)
+                        result = check_win_loss(actual_num)
 
-                    # উইন লস নির্ণয় (কালার, বিগ/স্মল অথবা জ্যাকপট নাম্বার মিললে WIN)
-                    is_jackpot = actual_num in [current_prediction["num1"], current_prediction["num2"]]
-                    is_size_win = (current_prediction["size"] == actual_size)
-                    is_color_win = (current_prediction["color"] in actual_color)
+                        # হিস্ট্রিতে ৪-ডিজিট পিরিয়ড যুক্ত করা (ছবির মতো: ২২২৯, ২২২৮ ইত্যাদি)
+                        stats["history"].append({
+                            "period": str(last_period)[-4:],
+                            "num": actual_num,
+                            "type": actual_size,
+                            "result": result
+                        })
 
-                    round_won = is_jackpot or is_size_win or is_color_win
+                    # পরবর্তী পিরিয়ডের জন্য প্যাটার্ন সার্চ
+                    analysis = analyze_pattern(history_list)
+                    current_pred.update(analysis)
+                    current_pred["period"] = period
+                    last_period = period
 
-                    # স্ট্যাটাস আপডেট (০ থেকে শুরু হওয়া কাউন্টার)
-                    stats["total_played"] += 1
-                    if round_won:
-                        stats["total_wins"] += 1
-                        stats["current_loss_streak"] = 0
-                    else:
-                        stats["total_losses"] += 1
-                        stats["current_loss_streak"] += 1
-                        if stats["current_loss_streak"] > stats["max_loss_streak"]:
-                            stats["max_loss_streak"] = stats["current_loss_streak"]
+                elif last_period is None:
+                    last_period = period
+                    analysis = analyze_pattern(history_list)
+                    current_pred.update(analysis)
+                    current_pred["period"] = period
 
-                    # হিস্ট্রি টেবিলে যোগ
-                    history_table.insert(0, {
-                        "period": last_result.get("period", last_processed_period),
-                        "number": actual_num,
-                        "size": actual_size,
-                        "win": round_won
-                    })
+                # লাইভ মেসেজ ও বাটন আপডেট
+                for chat_id, msg_id in list(active_dashboards.items()):
+                    header_text, keyboard = build_interface(chat_id, period, seconds_left)
+                    try:
+                        bot.edit_message_text(
+                            header_text,
+                            chat_id=chat_id,
+                            message_id=msg_id,
+                            parse_mode="HTML",
+                            reply_markup=keyboard
+                        )
+                    except ApiTelegramException as e:
+                        if "message to edit not found" in str(e).lower():
+                            active_dashboards.pop(chat_id, None)
+                    except Exception:
+                        pass
 
-                # নতুন রাউন্ডের জন্য প্রেডিকশন
-                current_prediction = analyze_and_predict(history)
-                last_processed_period = current_period
+            time.sleep(2)  # প্রতি ২ সেকেন্ড পর পর টাইমার ও বাটন সিঙ্ক
+        except Exception:
+            time.sleep(4)
 
-            # টেলিগ্রাম মেসেজ এবং কীবোর্ড আপডেট
-            markup = build_telegram_keyboard(current_period, remaining_seconds, current_prediction)
-            message_text = f"<b>{GAME_NAME}</b>\n<code>{SUB_TITLE}</code>"
+# --- টেলিগ্রাম বট হ্যান্ডলার ---
 
-            if telegram_message_id is None:
-                sent_msg = bot.send_message(
-                    CHANNEL_OR_CHAT_ID,
-                    message_text,
-                    reply_markup=markup,
-                    parse_mode="HTML"
-                )
-                telegram_message_id = sent_msg.message_id
-            else:
-                try:
-                    bot.edit_message_text(
-                        message_text,
-                        chat_id=CHANNEL_OR_CHAT_ID,
-                        message_id=telegram_message_id,
-                        reply_markup=markup,
-                        parse_mode="HTML"
-                    )
-                except telebot.apihelper.ApiTelegramException:
-                    pass  # মেসেজ অপরিবর্তিত থাকলে টেলিগ্রাম এরর হ্যান্ডলিং
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    chat_id = message.chat.id
+    user_pages[chat_id] = 1
+    init_msg = bot.send_message(chat_id, "<b>বট সংযুক্ত হচ্ছে...</b>", parse_mode="HTML")
+    active_dashboards[chat_id] = init_msg.message_id
 
-            time.sleep(3)  # প্রতি ৩ সেকেন্ড পর পর প্রগ্রেস বার ও টাইম কাউন্ট আপডেট
+@bot.callback_query_handler(func=lambda call: True)
+def handle_pagination(call):
+    chat_id = call.message.chat.id
+    cur = user_pages.get(chat_id, 1)
 
-        except Exception as err:
-            logging.error(f"Runtime Exception: {err}")
-            time.sleep(5)
+    if call.data == "page_prev":
+        if cur > 1:
+            user_pages[chat_id] = cur - 1
+            bot.answer_callback_query(call.id, text=f"পেজ {cur - 1}")
+        else:
+            bot.answer_callback_query(call.id, text="প্রথম পেজে আছেন")
+
+    elif call.data == "page_next":
+        if cur < 10:
+            user_pages[chat_id] = cur + 1
+            bot.answer_callback_query(call.id, text=f"পেজ {cur + 1}")
+        else:
+            bot.answer_callback_query(call.id, text="শেষ পেজে আছেন")
+
+    else:
+        bot.answer_callback_query(call.id)
 
 if __name__ == "__main__":
-    run_live_bot()
+    # ব্যাকগ্রাউন্ড প্রেডিকশন থ্রেড চালু
+    t = threading.Thread(target=live_worker, daemon=True)
+    t.start()
+
+    # টেলিগ্রাম বট পোলিং
+    bot.infinity_polling(skip_pending=True)
